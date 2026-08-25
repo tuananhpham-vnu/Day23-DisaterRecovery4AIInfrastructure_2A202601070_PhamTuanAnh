@@ -29,13 +29,71 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Mot lan poll /readyz. Tra ve (ready, reason).
+
+    timeout la BAT BUOC, khong phai tuy chon: che do netblock (SIGSTOP / iptables DROP)
+    van cho TCP handshake xong roi im lang -- khong co timeout thi httpx doi vo han va
+    vong lap poll dung han o day, health checker khong bao gio bao cao gi ca.
+    """
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except Exception as e:
+        # Ca hai deu la "khong serve duoc": connect refused (stop) va treo (netblock).
+        return False, f"probe_error:{type(e).__name__}"
+    if r.status_code == 200:
+        return True, "ready"
+    try:
+        reasons = ",".join(r.json().get("reasons") or []) or "not_ready"
+    except Exception:
+        reasons = "not_ready"
+    return False, f"http_{r.status_code}:{reasons}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll ca 2 region, chi ghi log khi trang thai THAY DOI.
+
+    State machine cho moi region:
+      - dem so lan fail LIEN TIEP; mot lan ok bat ky reset ve 0.
+      - HEALTHY -> UNHEALTHY chi khi consecutive_fails >= threshold (chong flapping, §4).
+      - UNHEALTHY -> HEALTHY ngay lan poll thanh cong dau tien (phuc hoi thi khong can cho:
+        cho them chi keo dai RTO ma khong giam rui ro nao).
+    Trang thai xuat phat la HEALTHY: health checker chi bao khi co GI DO DOI, nen mot
+    drill binh thuong (moi thu dang song) khong duoc de lai dong log nao ca. Neu khoi tao
+    la None thi dong dau tien luon la "HEALTHY" vo nghia, lan vao giua log cua incident.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    st = {r: {"state": "HEALTHY", "fails": 0, "oks": 0} for r in URL}
+    end = time.time() + duration
+    # mode "a": health-events.jsonl tich luy qua nhieu lan chay; measure_rto.py cat theo
+    # cua so thoi gian cua loadgen nen khong lan drill nay sang drill khac.
+    with out.open("a") as f:
+        def emit(**kw):
+            rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                   "interval_s": interval, "threshold": threshold, "timeout_s": timeout,
+                   "detect_floor_s": round(interval * threshold, 1), **kw}
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+            print("HEALTH", json.dumps(rec))
+            return rec
+
+        while time.time() < end:
+            t0 = time.time()
+            for region in URL:
+                ready, reason = probe(region, timeout)
+                s = st[region]
+                if ready:
+                    s["fails"], s["oks"] = 0, s["oks"] + 1
+                    new = "HEALTHY"
+                else:
+                    s["fails"], s["oks"] = s["fails"] + 1, 0
+                    # Chua du threshold thi GIU NGUYEN trang thai cu -- mot lan fail
+                    # khong phai outage, do la ban chat cua chong flapping.
+                    new = "UNHEALTHY" if s["fails"] >= threshold else s["state"]
+                if new != s["state"]:
+                    emit(event="state_change", region=region, **{"from": s["state"]}, to=new,
+                         reason=reason, consecutive_fails=s["fails"], consecutive_oks=s["oks"])
+                    s["state"] = new
+            time.sleep(max(0.0, interval - (time.time() - t0)))
 
 
 if __name__ == "__main__":
