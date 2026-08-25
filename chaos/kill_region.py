@@ -63,11 +63,74 @@ def is_alive(region: str, timeout=1.5) -> bool:
         return False
 
 
+IS_WIN = os.name == "nt"
+
+# Tren Windows, os.kill() KHONG gui signal: bat ky sig nao ngoai CTRL_*_EVENT deu
+# bien thanh TerminateProcess(). Nghia la os.kill(pid, 0) giet that, va SIGSTOP thi
+# khong treo process ma xoa so no -> netblock se bien thanh stop. Nen phai goi
+# NtSuspendProcess/NtResumeProcess qua ctypes de co dung semantics cua SIGSTOP/SIGCONT.
+_PROCESS_ALL_ACCESS = 0x1F0FFF
+_STILL_ACTIVE = 259
+
+
+def _win_open(pid: int):
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    h = k32.OpenProcess(_PROCESS_ALL_ACCESS, False, pid)
+    return k32, h
+
+
+def _win_alive(pid: int) -> bool:
+    import ctypes
+    k32, h = _win_open(pid)
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == _STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
+def _win_ctl(pid: int, action: str):
+    """action: suspend (SIGSTOP) | resume (SIGCONT) | kill (SIGKILL)."""
+    import ctypes
+    k32, h = _win_open(pid)
+    if not h:
+        raise OSError(ctypes.get_last_error(), f"OpenProcess({pid}) that bai")
+    try:
+        if action == "kill":
+            if not k32.TerminateProcess(h, 1):
+                raise OSError(ctypes.get_last_error(), f"TerminateProcess({pid}) that bai")
+            return
+        ntdll = ctypes.WinDLL("ntdll")
+        fn = ntdll.NtSuspendProcess if action == "suspend" else ntdll.NtResumeProcess
+        status = fn(ctypes.c_void_p(h))
+        if status != 0:
+            raise OSError(f"Nt{action.capitalize()}Process({pid}) -> NTSTATUS 0x{status & 0xffffffff:08x}")
+    finally:
+        k32.CloseHandle(h)
+
+
+def proc_ctl(pid: int, action: str):
+    if IS_WIN:
+        return _win_ctl(pid, action)
+    os.kill(pid, {"suspend": signal.SIGSTOP, "resume": signal.SIGCONT,
+                  "kill": signal.SIGKILL}[action])
+
+
 def pid_of(region: str) -> int | None:
     f = PID_DIR / f"region-{region}.pid"
     if not f.exists():
         return None
-    pid = int(f.read_text().strip())
+    txt = f.read_text().strip()
+    if not txt:
+        return None
+    pid = int(txt)
+    if IS_WIN:
+        return pid if _win_alive(pid) else None
     try:
         os.kill(pid, 0)
         return pid
@@ -96,7 +159,7 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
         # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
         #           (đúng hành vi của iptables DROP ở tầng app)
         # stop    : SIGKILL -> cổng đóng => ConnectError ngay
-        os.kill(pid, signal.SIGSTOP if mode == "netblock" else signal.SIGKILL)
+        proc_ctl(pid, "suspend" if mode == "netblock" else "kill")
     else:
         svc = f"serving-{region}"
         if mode == "stop":
@@ -111,7 +174,7 @@ def restore(region: str, backend: str):
     if backend == "bare":
         pid = pid_of(region)
         if pid:
-            os.kill(pid, signal.SIGCONT)
+            proc_ctl(pid, "resume")
             return event(action="restore", region=region, method="SIGCONT", pid=pid)
         return event(action="restore", region=region, method="need_manual_start",
                      note="process da bi SIGKILL, chay `make up-bare` lai")

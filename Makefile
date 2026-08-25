@@ -1,4 +1,16 @@
-.PHONY: seed up-bare down-bare drill-baseline drill-dr rto test clean
+# Tren Windows, GNU Make mac dinh dung cmd.exe -> khong co printf/sleep/&/wait.
+# Ep dung bash cua Git for Windows. Phai dung duong dan 8.3 (PROGRA~1) vi
+# CreateProcess cua make khong xu ly duoc khoang trang trong SHELL, va "bash.exe"
+# tran trui co the tro nham vao stub WSL trong WindowsApps.
+ifeq ($(OS),Windows_NT)
+GIT_BASH := $(firstword $(wildcard C:/PROGRA~1/Git/usr/bin/bash.exe C:/PROGRA~2/Git/usr/bin/bash.exe C:/PROGRA~1/Git/bin/bash.exe))
+ifneq ($(GIT_BASH),)
+SHELL := $(GIT_BASH)
+.SHELLFLAGS := -c
+endif
+endif
+
+.PHONY: seed up-bare down-bare drill-baseline drill-dr drill-full rto test clean
 
 seed:
 	python3 state/seed_vectors.py --region a --docs 200
@@ -13,9 +25,7 @@ down-bare:
 
 # Bước 2: baseline không DR — dùng đúng script sinh viên sẽ chạy tay
 drill-baseline:
-	python3 loadgen/traffic.py --duration 40 --rps 2 --out reports/drill-1-nodr.jsonl &
-	sleep 8; python3 chaos/kill_region.py --region a --mode netblock --mock
-	wait
+	bash scripts/drill_baseline.sh
 
 # Bước 4: replay attack sau khi contain xong
 # replicate.py phai chay TRUOC va co it nhat 1 chu ky xong, khong thi failover.py
@@ -28,11 +38,17 @@ drill-dr:
 	python3 dr/health_checker.py --interval 5 --threshold 3 --duration 100 --out reports/health-events.jsonl &
 	sleep 12; python3 chaos/kill_region.py --region a --mode netblock --mock
 
+# Step 4 GUIDE.md day du: drill + runbook + do RTO (chay duoc tren Windows)
+drill-full:
+	bash scripts/drill_dr.sh
+
 rto:
 	python3 tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl --target-rto 300
 
+# PYTHONUTF8=1: tests doc reports/*.md bang Path.read_text() khong truyen encoding ->
+# tren Windows mac dinh cp1252 va no vo ngay o ky tu tieng Viet dau tien.
 test:
-	python3 -m pytest tests/ -v
+	PYTHONUTF8=1 python3 -m pytest tests/ -v
 
 clean:
 	bash scripts/down_bare.sh 2>/dev/null || true
